@@ -26,10 +26,12 @@ dist/
 
 # Logs
 *.log
+src/lightning_logs/
 
 # Dataset files downloaded during execution
-spam.csv
 *.csv
+*.gz
+data/aclImdb/
 
 # Model checkpoint / trained model files
 *.pt

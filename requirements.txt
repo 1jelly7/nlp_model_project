@@ -3,6 +3,8 @@
 # 우선 PyCharm 터미널에서 아래 파일로 설치를 시도합니다.
 # pip install -r requirements.txt
 
+setuptools<82.0.0
+
 numpy==1.26.4
 pandas>=2.1
 matplotlib>=3.8
