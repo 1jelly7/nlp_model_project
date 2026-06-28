@@ -27,6 +27,7 @@ dist/
 # Logs
 *.log
 src/lightning_logs/
+assignment/lightning_logs/
 
 # Dataset files downloaded during execution
 *.csv
