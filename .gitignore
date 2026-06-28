@@ -32,6 +32,7 @@ assignment/lightning_logs/
 # Dataset files downloaded during execution
 *.csv
 *.gz
+*.json
 data/aclImdb/
 
 # Model checkpoint / trained model files

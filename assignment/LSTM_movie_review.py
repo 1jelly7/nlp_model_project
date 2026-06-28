@@ -29,6 +29,18 @@ from pathlib import Path
 # typing은 함수 인자와 반환값의 타입을 명시하기 위해 사용합니다.
 from typing import Dict, List, Tuple
 
+# 원본 문장으로 캐시 키를 만들기 위해 사용합니다.
+import hashlib
+
+# 토큰 캐시 파일을 JSON 형식으로 저장하고 읽기 위해 사용합니다.
+import json
+
+# 형태소 분석을 프로세스 병렬 처리하기 위해 사용합니다.
+from concurrent.futures import ProcessPoolExecutor
+
+# 한국어 형태소 분석기 Okt를 사용합니다.
+from konlpy.tag import Okt
+
 # ---------------------------------------------------------------------
 # 2. 딥러닝 라이브러리 불러오기
 # ---------------------------------------------------------------------
@@ -58,7 +70,7 @@ class Config:
 
     # 학습에 사용할 한국어 리뷰 데이터 파일 경로입니다.
     # 실제 첨부 파일명은 ratings-data.txt 입니다.
-    data_path: str = "../data/ratings.txt"
+    data_path: str = '../data/ratings.txt'
 
     # 한 문장에서 사용할 최대 토큰 수입니다.
     # 긴 문장은 앞에서부터 max_len개만 사용하고 짧은 문장은 패딩합니다.
@@ -73,7 +85,7 @@ class Config:
     min_freq: int = 2
 
     # 한 번의 학습 단계에서 사용할 샘플 수입니다.
-    batch_size: int = 64
+    batch_size: int = 128
 
     # 단어 하나를 몇 차원의 벡터로 표현할지 지정합니다.
     embedding_dim: int = 128
@@ -88,7 +100,7 @@ class Config:
     dropout: float = 0.3
 
     # 옵티마이저의 학습률입니다.
-    learning_rate: float = 0.001
+    learning_rate: float = 3e-4
 
     # 전체 데이터를 몇 번 반복 학습할지 지정합니다.
     max_epochs: int = 5
@@ -106,10 +118,59 @@ class Config:
     # 재현 가능한 실행을 위한 랜덤 시드입니다.
     seed: int = 42
 
+    # 형태소 분석 결과를 저장할 캐시 파일 경로입니다.
+    morph_cache_path: str = './ratings_morph_cache.json'
+
+    # 형태소 분석 병렬 처리에 사용할 프로세스 수입니다.
+    morph_num_workers: int = 4
+
 
 # ---------------------------------------------------------------------
 # 4. 텍스트 전처리 함수
 # ---------------------------------------------------------------------
+
+# 각 프로세스에서 재사용할 전역 Okt 객체입니다.
+_okt = None
+
+
+def _get_okt():
+    """프로세스별로 Okt 객체를 한 번만 생성해서 재사용합니다."""
+
+    # 전역 Okt 객체를 사용합니다.
+    global _okt
+
+    # 아직 생성되지 않은 경우에만 초기화합니다.
+    if _okt is None:
+        _okt = Okt()
+
+    return _okt
+
+
+def _tokenize_worker(text: str) -> List[str]:
+    """병렬 프로세스에서 문장 하나를 형태소 분석하는 함수입니다."""
+
+    # 현재 프로세스에서 사용할 Okt 객체를 가져옵니다.
+    okt = _get_okt()
+
+    # 정규화와 어간 추출을 적용해 품사 분석을 수행합니다.
+    pos_tokens = okt.pos(text, norm=True, stem=True)
+
+    # 제거할 조사, 어미, 문장부호 품사를 정의합니다.
+    stop_pos = {'Josa', 'Eomi', 'Punctuation'}
+
+    # 불필요 품사를 제거하고 짧은 감성 핵심 토큰은 예외로 유지합니다.
+    tokens = [word for word, pos in pos_tokens if pos not in stop_pos and (len(word) > 1 or word in {'안', '못'})]
+
+    # 최종 토큰 리스트를 반환합니다.
+    return tokens
+
+
+def make_cache_key(text: str) -> str:
+    """문장별 캐시 조회를 위한 해시 키를 생성합니다."""
+
+    # 동일 문장이면 항상 같은 키가 생성되도록 SHA-256 해시를 사용합니다.
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
 
 def clean_text(text: str) -> str:
     """한국어 리뷰 문장을 모델 입력용으로 정리합니다."""
@@ -134,34 +195,37 @@ def clean_text(text: str) -> str:
 
 
 def tokenize(text: str) -> List[str]:
-    """문장을 공백 기준 토큰 리스트로 분리합니다."""
+    """문장을 형태소 분석하여 토큰 리스트로 분리합니다."""
 
-    # clean_text()로 먼저 정리한 뒤 공백 기준으로 토큰화합니다.
-    return clean_text(text).split()
+    # 형태소 분석 전에 텍스트를 정리합니다.
+    text = clean_text(text)
+
+    # Okt 기반 형태소 분석 결과를 반환합니다.
+    return _tokenize_worker(text)
 
 
 # ---------------------------------------------------------------------
-# 5. ratings-data.txt 파일 로드 함수
+# 5. ratings.txt 파일 로드 함수
 # ---------------------------------------------------------------------
 
-def read_ratings_file(data_path: Path) -> List[Tuple[str, int]]:
+def read_ratings_file(data_path: Path, config: Config) -> List[Tuple[List[str], int]]:
     """ratings-data.txt 파일에서 리뷰와 라벨을 읽어옵니다."""
 
     # 파일이 실제로 존재하는지 먼저 확인합니다.
     if not data_path.exists():
         raise FileNotFoundError(f"데이터 파일을 찾을 수 없습니다: {data_path}")
 
-    # 최종적으로 (문장, 라벨) 쌍을 저장할 리스트입니다.
-    samples: List[Tuple[str, int]] = []
+    # 파일에서 읽은 원본 텍스트와 라벨을 임시 저장합니다.
+    raw_rows = []
 
     # UTF-8 인코딩으로 파일을 엽니다.
-    with open(data_path, "r", encoding="utf-8") as f:
+    with open(data_path, 'r', encoding='utf-8') as f:
 
-        # 탭 구분 파일이므로 delimiter를 "\t"로 지정합니다.
-        reader = csv.DictReader(f, delimiter="\t")
+        # 탭 구분 파일이므로 delimiter를 '\t'로 지정합니다.
+        reader = csv.DictReader(f, delimiter='\t')
 
         # 반드시 있어야 하는 컬럼 이름입니다.
-        required_columns = {"document", "label"}
+        required_columns = {'document', 'label'}
 
         # 헤더가 없거나 필요한 컬럼이 빠져 있으면 오류를 발생시킵니다.
         if reader.fieldnames is None or not required_columns.issubset(set(reader.fieldnames)):
@@ -171,23 +235,91 @@ def read_ratings_file(data_path: Path) -> List[Tuple[str, int]]:
 
         # 파일의 각 행을 하나씩 읽습니다.
         for row in reader:
-
             # 리뷰 문장을 가져와 전처리합니다.
-            text = clean_text(row["document"])
+            text = clean_text(row['document'])
 
             # 전처리 결과가 비어 있으면 학습에 도움이 되지 않으므로 건너뜁니다.
             if not text:
                 continue
 
             # 라벨 값을 정수형으로 변환합니다.
-            label = int(row["label"])
+            label = int(row['label'])
 
             # 라벨이 0 또는 1인 경우만 사용합니다.
             if label not in (0, 1):
                 continue
 
             # (문장, 라벨) 형태로 샘플 리스트에 추가합니다.
-            samples.append((text, label))
+            raw_rows.append((text, label))
+
+    # 캐시 파일 경로를 Path 객체로 변환합니다.
+    cache_path = Path(config.morph_cache_path)
+
+    # 이전 실행에서 저장한 캐시 파일이 있는지 확인합니다.
+    if cache_path.exists():
+        # 캐시 파일을 엽니다.
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            # 캐시 JSON을 딕셔너리로 읽어옵니다.
+            morph_cache = json.load(f)
+    # 캐시 파일이 없으면 빈 딕셔너리로 시작합니다.
+    else:
+        # 새 캐시 저장소를 초기화합니다.
+        morph_cache = {}
+
+    # 아직 캐시에 없는 문장만 따로 모읍니다.
+    missing_texts = []
+    # 캐시에 저장할 키 목록을 함께 유지합니다.
+    missing_keys = []
+
+    # 전체 문장을 순회하며 캐시 존재 여부를 확인합니다.
+    for text, _ in raw_rows:
+        # 현재 문장의 캐시 키를 생성합니다.
+        key = make_cache_key(text)
+        # 캐시에 없는 문장만 병렬 처리 대상으로 분류합니다.
+        if key not in morph_cache:
+            # 저장할 캐시 키를 기록합니다.
+            missing_keys.append(key)
+            # 형태소 분석이 필요한 문장을 기록합니다.
+            missing_texts.append(text)
+
+    # 새로 분석할 문장이 하나라도 있으면 병렬 형태소 분석을 수행합니다.
+    if missing_texts:
+        # 병렬 처리 대상 수를 출력합니다.
+        print(f"[형태소 분석] 새 문장 {len(missing_texts)}개를 병렬 처리합니다.")
+        # 프로세스 풀을 생성합니다.
+        with ProcessPoolExecutor(max_workers=config.morph_num_workers) as executor:
+            # 문장 리스트를 병렬 형태소 분석합니다.
+            tokenized_results = list(executor.map(_tokenize_worker, missing_texts))
+        # 분석 결과를 캐시 딕셔너리에 반영합니다.
+        for key, tokens in zip(missing_keys, tokenized_results):
+            # 문장 해시 키 기준으로 토큰 리스트를 저장합니다.
+            morph_cache[key] = tokens
+        # 갱신된 캐시를 파일에 저장합니다.
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            # 한글이 깨지지 않도록 캐시를 JSON으로 저장합니다.
+            json.dump(morph_cache, f, ensure_ascii=False)
+        # 캐시 저장 완료 메시지를 출력합니다.
+        print(f"[형태소 분석] 캐시 저장 완료: {cache_path}")
+    # 모든 문장이 캐시에 있으면 형태소 분석을 생략합니다.
+    else:
+        # 캐시 재사용 메시지를 출력합니다.
+        print(f"[형태소 분석] 기존 캐시 사용: {cache_path}")
+
+    # 최종적으로 (토큰 리스트, 라벨) 쌍을 저장할 리스트입니다.
+    samples: List[Tuple[List[str], int]] = []
+
+    # 원본 문장 순서대로 최종 샘플을 만듭니다.
+    for text, label in raw_rows:
+        # 현재 문장의 캐시 키를 다시 생성합니다.
+        key = make_cache_key(text)
+        # 캐시에서 토큰 리스트를 가져옵니다.
+        tokens = morph_cache[key]
+        # 토큰이 비어 있으면 학습에 도움이 되지 않으므로 제외합니다.
+        if not tokens:
+            # 다음 샘플로 넘어갑니다.
+            continue
+        # 토큰 리스트와 라벨 쌍을 저장합니다.
+        samples.append((tokens, label))
 
     # 라벨이나 입력 순서 편향을 줄이기 위해 데이터를 섞습니다.
     random.shuffle(samples)
@@ -197,10 +329,10 @@ def read_ratings_file(data_path: Path) -> List[Tuple[str, int]]:
 
 
 def split_samples(
-    samples: List[Tuple[str, int]],
+    samples: List[Tuple[List[str], int]],
     val_ratio: float,
     test_ratio: float
-) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]], List[Tuple[str, int]]]:
+) -> Tuple[List[Tuple[List[str], int]], List[Tuple[List[str], int]], List[Tuple[List[str], int]]]:
     """전체 샘플을 train/val/test로 분할합니다."""
 
     # 전체 샘플 개수를 계산합니다.
@@ -232,14 +364,14 @@ def split_samples(
     return train_samples, val_samples, test_samples
 
 
-def load_data(config: Config) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]], List[Tuple[str, int]]]:
+def load_data(config: Config) -> Tuple[List[Tuple[List[str], int]], List[Tuple[List[str], int]], List[Tuple[List[str], int]]]:
     """데이터 파일을 읽고 train/val/test로 나누어 반환합니다."""
 
     # 설정에 지정된 데이터 경로를 Path 객체로 변환합니다.
     data_path = Path(config.data_path)
 
     # TSV 파일에서 전체 샘플을 읽어옵니다.
-    samples = read_ratings_file(data_path)
+    samples = read_ratings_file(data_path, config)
 
     # 전체 샘플을 train/val/test로 나눕니다.
     train_samples, val_samples, test_samples = split_samples(
@@ -260,21 +392,20 @@ def load_data(config: Config) -> Tuple[List[Tuple[str, int]], List[Tuple[str, in
 # 6. Vocabulary 생성 함수
 # ---------------------------------------------------------------------
 
-def build_vocab(samples: List[Tuple[str, int]], config: Config) -> Dict[str, int]:
+def build_vocab(samples: List[Tuple[List[str], int]], config: Config) -> Dict[str, int]:
     """훈련 데이터에서 vocabulary를 생성합니다."""
 
     # 단어 빈도를 저장할 Counter 객체를 만듭니다.
     counter = Counter()
 
     # 모든 훈련 샘플을 순회합니다.
-    for text, _ in samples:
-
-        # 각 문장을 토큰화한 뒤 빈도를 누적합니다.
-        counter.update(tokenize(text))
+    for tokens, _ in samples:
+        # 토큰 리스트로 빈도를 누적합니다.
+        counter.update(tokens)
 
     # 특수 토큰을 먼저 vocabulary에 등록합니다.
     # <PAD>는 패딩용, <UNK>는 vocabulary에 없는 단어용입니다.
-    word_to_index: Dict[str, int] = {"<PAD>": 0, "<UNK>": 1}
+    word_to_index: Dict[str, int] = {'<PAD>': 0, '<UNK>': 1}
 
     # 빈도가 높은 단어부터 최대 크기까지 vocabulary에 추가합니다.
     for word, freq in counter.most_common(config.max_vocab_size - len(word_to_index)):
@@ -294,22 +425,19 @@ def build_vocab(samples: List[Tuple[str, int]], config: Config) -> Dict[str, int
     return word_to_index
 
 
-def encode_text(text: str, word_to_index: Dict[str, int], max_len: int) -> torch.Tensor:
-    """문장 하나를 고정 길이 정수 텐서로 변환합니다."""
-
-    # 문장을 토큰 리스트로 변환합니다.
-    tokens = tokenize(text)
+def encode_text(tokens: List[str], word_to_index: Dict[str, int], max_len: int) -> torch.Tensor:
+    """토큰 리스트를 고정 길이 정수 텐서로 변환합니다."""
 
     # 각 토큰을 vocabulary 인덱스로 바꿉니다.
     # vocabulary에 없는 단어는 <UNK> 인덱스를 사용합니다.
-    token_ids = [word_to_index.get(token, word_to_index["<UNK>"]) for token in tokens]
+    token_ids = [word_to_index.get(token, word_to_index['<UNK>']) for token in tokens]
 
     # 너무 긴 문장은 max_len까지만 사용합니다.
     token_ids = token_ids[:max_len]
 
     # 너무 짧은 문장은 뒤에 <PAD>를 채워 길이를 맞춥니다.
     if len(token_ids) < max_len:
-        token_ids = token_ids + [word_to_index["<PAD>"]] * (max_len - len(token_ids))
+        token_ids = token_ids + [word_to_index['<PAD>']] * (max_len - len(token_ids))
 
     # 정수 리스트를 torch.long 타입 텐서로 변환합니다.
     return torch.tensor(token_ids, dtype=torch.long)
@@ -322,7 +450,7 @@ def encode_text(text: str, word_to_index: Dict[str, int], max_len: int) -> torch
 class RatingsDataset(Dataset):
     """한국어 리뷰 데이터와 라벨을 제공하는 Dataset 클래스입니다."""
 
-    def __init__(self, samples: List[Tuple[str, int]], word_to_index: Dict[str, int], max_len: int):
+    def __init__(self, samples: List[Tuple[List[str], int]], word_to_index: Dict[str, int], max_len: int):
         # 원본 샘플 리스트를 저장합니다.
         self.samples = samples
 
@@ -338,10 +466,10 @@ class RatingsDataset(Dataset):
 
     def __getitem__(self, index: int):
         # 지정된 위치의 텍스트와 라벨을 가져옵니다.
-        text, label = self.samples[index]
+        tokens, label = self.samples[index]
 
         # 텍스트를 고정 길이 정수 텐서로 변환합니다.
-        input_ids = encode_text(text, self.word_to_index, self.max_len)
+        input_ids = encode_text(tokens, self.word_to_index, self.max_len)
 
         # 라벨을 LongTensor로 변환합니다.
         label_tensor = torch.tensor(label, dtype=torch.long)
@@ -372,12 +500,19 @@ class RatingsDataModule(pl.LightningDataModule):
         self.val_dataset = None
         self.test_dataset = None
 
+        # setup()이 중복 실행되는 것을 막기 위한 플래그입니다.
+        self._is_setup = False
+
     def prepare_data(self) -> None:
         # 한 번만 수행되는 다운로드 작업 등이 있을 때 사용하는 메서드입니다.
         # 현재 예제에서는 별도 다운로드가 없으므로 비워 둡니다.
         pass
 
     def setup(self, stage: str = None) -> None:
+        # 이미 한 번 setup이 끝났으면 다시 실행하지 않습니다.
+        if self._is_setup:
+            return
+
         # 데이터 파일을 읽고 train/val/test로 분리합니다.
         train_samples, val_samples, test_samples = load_data(self.config)
 
@@ -392,6 +527,9 @@ class RatingsDataModule(pl.LightningDataModule):
 
         # 테스트 Dataset 객체를 생성합니다.
         self.test_dataset = RatingsDataset(test_samples, self.word_to_index, self.config.max_len)
+
+        # setup 완료 상태를 기록합니다.
+        self._is_setup = True
 
         # Dataset 준비 결과를 출력합니다.
         print(
@@ -467,14 +605,15 @@ class LSTMClassifier(pl.LightningModule):
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=False,
+            bidirectional=True,
         )
 
         # Dropout 계층은 과적합을 줄이는 역할을 합니다.
         self.dropout = nn.Dropout(dropout)
 
         # 최종 분류 계층은 hidden_dim을 2개 클래스 점수로 변환합니다.
-        self.classifier = nn.Linear(hidden_dim, 2)
+        # bidirectional=True면 양방향 hidden을 이어붙이므로 입력 차원을 2배로 늘립니다.
+        self.classifier = nn.Linear(hidden_dim * 2, 2)
 
         # 손실 함수로 CrossEntropyLoss를 사용합니다.
         self.loss_fn = nn.CrossEntropyLoss()
@@ -489,14 +628,24 @@ class LSTMClassifier(pl.LightningModule):
         self.test_acc = BinaryAccuracy()
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # 패딩이 아닌 실제 토큰의 길이를 계산합니다.
+        lengths = (input_ids != 0).sum(dim=1).cpu()
+        # 길이가 0인 경우(전부 PAD) 최소 1로 보정합니다.
+        lengths = lengths.clamp(min=1)
+
         # 입력 토큰 인덱스를 임베딩 벡터로 변환합니다.
         embedded = self.embedding(input_ids)
 
-        # LSTM에 임베딩 시퀀스를 입력합니다.
-        _, (hidden, _) = self.lstm(embedded)
+        # PAD를 제외하고 LSTM이 실제 토큰만 처리하도록 패킹합니다.
+        packed = nn.utils.rnn.pack_padded_sequence(
+            embedded, lengths, batch_first=True, enforce_sorted=False
+        )
 
-        # 마지막 LSTM 층의 마지막 은닉 상태를 문장 벡터로 사용합니다.
-        sentence_vector = hidden[-1]
+        # LSTM에 임베딩 시퀀스를 입력합니다.
+        _, (hidden, _) = self.lstm(packed)
+
+        # 양방향 마지막 hidden state를 합칩니다.
+        sentence_vector = torch.cat([hidden[-2], hidden[-1]], dim=1)
 
         # 문장 벡터에 Dropout을 적용합니다.
         sentence_vector = self.dropout(sentence_vector)
@@ -551,10 +700,24 @@ class LSTMClassifier(pl.LightningModule):
 
     def configure_optimizers(self):
         # Adam optimizer를 생성합니다.
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.learning_rate, weight_decay=1e-4)
 
-        # 생성한 optimizer를 반환합니다.
-        return optimizer
+        # 검증 손실이 정체되면 학습률을 자동으로 낮춥니다.
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=0.5,
+            patience=2,
+        )
+
+        # 생성한 optimizer와 scheduler를 반환합니다.
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val_loss",
+            }
+        }
 
 
 # ---------------------------------------------------------------------
@@ -574,9 +737,11 @@ def predict_sentiment(
 
     # 예측 과정에서는 그래디언트를 계산할 필요가 없으므로 no_grad를 사용합니다.
     with torch.no_grad():
+        # 예측 문장을 형태소 분석하여 토큰 리스트로 변환합니다.
+        tokens = tokenize(text)
 
-        # 입력 문장을 인덱스 텐서로 변환합니다.
-        input_ids = encode_text(text, word_to_index, config.max_len)
+        # 토큰 리스트를 인덱스 텐서로 변환합니다.
+        input_ids = encode_text(tokens, word_to_index, config.max_len)
 
         # 배치 차원을 추가하여 형태를 (1, 문장길이)로 만듭니다.
         input_ids = input_ids.unsqueeze(0)
@@ -625,6 +790,9 @@ def main() -> None:
     # vocabulary 크기를 구합니다.
     vocab_size = len(data_module.word_to_index)
 
+    batch = next(iter(data_module.train_dataloader()))  # 추가: 첫 배치를 가져와 입력 인덱스를 점검합니다.
+    input_ids, labels = batch  # 추가: 입력과 라벨을 분리합니다.
+
     # 모델 객체를 생성합니다.
     model = LSTMClassifier(
         vocab_size=vocab_size,
@@ -633,7 +801,7 @@ def main() -> None:
         num_layers=config.num_layers,
         dropout=config.dropout,
         learning_rate=config.learning_rate,
-        pad_index=data_module.word_to_index["<PAD>"],
+        pad_index=data_module.word_to_index['<PAD>'],
     )
 
     # GPU 사용 가능 여부에 따라 accelerator를 자동 선택합니다.
