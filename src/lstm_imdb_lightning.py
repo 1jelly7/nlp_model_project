@@ -559,6 +559,11 @@ class LSTMClassifier(pl.LightningModule):
         self.test_acc = BinaryAccuracy()
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # 패딩이 아닌 실제 토큰의 길이를 계산합니다.
+        lengths = (input_ids != 0).sum(dim=1).cpu()
+        # 길이가 0인 경우(전부 PAD) 최소 1로 보정합니다.
+        lengths = lengths.clamp(min=1)
+
         # input_ids 형태: (배치크기, 문장길이)
         # 각 값은 vocabulary의 정수 인덱스입니다.
 
@@ -566,10 +571,15 @@ class LSTMClassifier(pl.LightningModule):
         # embedded 형태: (배치크기, 문장길이, 임베딩차원)
         embedded = self.embedding(input_ids)
 
+        # PAD를 제외하고 LSTM이 실제 토큰만 처리하도록 패킹합니다.
+        packed = nn.utils.rnn.pack_padded_sequence(
+            embedded, lengths, batch_first=True, enforce_sorted=False
+        )
+
         # LSTM에 임베딩 시퀀스를 입력합니다.
         # output은 모든 시점의 은닉 상태입니다.
         # hidden은 마지막 시점의 은닉 상태입니다.
-        output, (hidden, cell) = self.lstm(embedded)
+        output, (hidden, cell) = self.lstm(packed)
 
         # num_layers가 1이고 단방향 LSTM이면 hidden[-1]이 마지막 계층의 마지막 은닉 상태입니다.
         # sentence_vector 형태: (배치크기, hidden_dim)
